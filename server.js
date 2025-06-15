@@ -6,17 +6,19 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 dotenv.config();
 
+const { sendReminderEmail } = require('./mailer');
+
 const app = express();
+const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
 // Connect to MongoDB Atlas using environment variable
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true,
-});
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch((err) => console.error('❌ MongoDB connection error:', err));
 
 const taskStepSchema = new mongoose.Schema({
   title: String,
@@ -29,9 +31,8 @@ const taskSchema = new mongoose.Schema({
   dueDate: Date,
   completed: { type: Boolean, default: false },
   steps: [taskStepSchema],
-  reminderCount: { type: Number, default: 1 },
-  reminderDaysBefore: { type: Number, default: 1 },
   recipients: [String],
+  reminderSchedule: [Number], // Array of days before due date
 });
 
 const Task = mongoose.model('Task', taskSchema);
@@ -76,16 +77,14 @@ app.get('/tasks/status/:status', async (req, res) => {
   res.send(tasks);
 });
 
-// Get tasks due in next X days for reminders
 app.get('/tasks/reminders/upcoming', async (req, res) => {
   const now = new Date();
   const tasks = await Task.find({ completed: false });
 
   const dueSoon = tasks.filter(task => {
-    const daysBefore = task.reminderDaysBefore || 1;
     const targetDate = new Date(task.dueDate);
     const diffInDays = Math.ceil((targetDate - now) / (1000 * 60 * 60 * 24));
-    return diffInDays <= daysBefore && diffInDays >= 0;
+    return task.reminderSchedule?.includes(diffInDays);
   });
 
   res.send(dueSoon);
@@ -110,7 +109,62 @@ app.put('/tasks/:id/step/:stepIndex/complete', async (req, res) => {
   }
 });
 
-// Start server
-app.listen(3000, () => {
-  console.log('Server running on http://localhost:3000');
+// Send reminders manually
+app.post('/api/reminders/send', async (req, res) => {
+  try {
+    const upcomingTasks = await Task.find({
+      dueDate: {
+        $gte: new Date(),
+        $lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      },
+      completed: false,
+    });
+
+    const now = new Date();
+    let sentCount = 0;
+
+    for (const task of upcomingTasks) {
+      const dueDate = new Date(task.dueDate);
+      const diffInDays = Math.ceil((dueDate - now) / (1000 * 60 * 60 * 24));
+
+      if (task.reminderSchedule?.includes(diffInDays)) {
+        const subject = `Reminder: ${task.title} is due soon`;
+        const html = `
+          <div style="font-family: Arial, sans-serif; color: #333;">
+            <h2>📌 Task Reminder: ${task.title}</h2>
+            <p>${task.description}</p>
+            <p><strong>Due Date:</strong> <span style="color: #d9534f;">${dueDate.toLocaleDateString()}</span></p>
+            <p>👉 <a href="http://localhost:5173/task/${task._id}" style="color: #0d6efd;">Click here to view this task</a></p>
+            <hr>
+            <p>This is an automated reminder from the <strong>Compliance Tracker System</strong>.</p>
+            <p>Please ensure this task is completed on time.</p>
+            <br>
+            <p style="font-size: 0.9em; color: #777;">If you have already completed this task, you may ignore this email.</p>
+          </div>
+        `;
+
+        for (const recipient of task.recipients) {
+          try {
+            console.log(`📧 Sending to: ${recipient}`);
+            const result = await sendReminderEmail(recipient, subject, html);
+            const statusCode = result?.[0]?.statusCode || 'OK';
+            console.log(`✅ Sent to ${recipient} | Status: ${statusCode}`);
+            sentCount++;
+          } catch (err) {
+            console.error(`❌ Failed to send to ${recipient}:`, err.message);
+          }
+        }
+      }
+    }
+
+    res.json({ sent: sentCount });
+  } catch (error) {
+    console.error('❌ Reminder email error:', error);
+    res.status(500).json({ error: 'Failed to send reminders' });
+  }
+});
+
+// Start the server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
